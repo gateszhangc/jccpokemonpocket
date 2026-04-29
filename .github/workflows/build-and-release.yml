@@ -1,0 +1,148 @@
+name: Build And Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jccpokemonpocket-release
+  cancel-in-progress: true
+
+env:
+  REGISTRY_HOST: ${{ vars.REGISTRY_HOST || 'registry.144.91.77.245.sslip.io' }}
+  IMAGE_REPOSITORY: ${{ vars.IMAGE_REPOSITORY || 'jccpokemonpocket' }}
+  IMAGE_NAME: ${{ format('{0}/{1}', vars.REGISTRY_HOST || 'registry.144.91.77.245.sslip.io', vars.IMAGE_REPOSITORY || 'jccpokemonpocket') }}
+  FLEET_REPO: ${{ vars.FLEET_REPO || 'gateszhangc/k8s-fleet' }}
+  FLEET_KUSTOMIZATION_PATH: ${{ vars.FLEET_KUSTOMIZATION_PATH || 'tenants/jccpokemonpocket/kustomization.yaml' }}
+  FLEET_IMAGE_NAME: ${{ vars.FLEET_IMAGE_NAME || format('{0}/{1}', vars.REGISTRY_HOST || 'registry.144.91.77.245.sslip.io', vars.IMAGE_REPOSITORY || 'jccpokemonpocket') }}
+  K8S_BUILD_NAMESPACE: ${{ vars.K8S_BUILD_NAMESPACE || 'build-jobs' }}
+  K8S_BUILD_SERVICE_ACCOUNT: ${{ vars.K8S_BUILD_SERVICE_ACCOUNT || 'kaniko-builder' }}
+  K8S_DOCKER_CONFIG_SECRET: ${{ vars.K8S_DOCKER_CONFIG_SECRET || 'registry-push' }}
+  K8S_GITHUB_TOKEN_SECRET: ${{ vars.K8S_GITHUB_TOKEN_SECRET || 'github-repo-reader' }}
+  K8S_GITHUB_TOKEN_KEY: ${{ vars.K8S_GITHUB_TOKEN_KEY || 'token' }}
+  K8S_JOB_TTL_SECONDS: ${{ vars.K8S_JOB_TTL_SECONDS || '600' }}
+  DOCKERFILE_PATH: Dockerfile
+
+jobs:
+  build-and-push:
+    if: github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message, '[skip ci]')
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      job_name: ${{ steps.meta.outputs.job_name }}
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Derive image tag
+        id: meta
+        run: |
+          echo "image_tag=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "job_name=jccpokemonpocket-image-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.31.0
+
+      - name: Configure kubeconfig
+        env:
+          KUBE_CONFIG_DATA: ${{ secrets.KUBE_CONFIG_DATA || secrets.KUBECONFIG_B64 }}
+        run: |
+          test -n "$KUBE_CONFIG_DATA"
+          mkdir -p "$HOME/.kube"
+          printf '%s' "$KUBE_CONFIG_DATA" | base64 --decode > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+
+      - name: Render K8s build job manifest
+        env:
+          JOB_NAME: ${{ steps.meta.outputs.job_name }}
+          IMAGE_TAG: ${{ steps.meta.outputs.image_tag }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SHA: ${{ github.sha }}
+          CACHE_REPO: ${{ format('{0}/{1}-cache', vars.REGISTRY_HOST || 'registry.144.91.77.245.sslip.io', vars.IMAGE_REPOSITORY || 'jccpokemonpocket') }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          template = Path(".github/manifests/k8s-image-build-job.yaml").read_text()
+          missing = set()
+
+          def replace_var(match):
+              key = match.group(1)
+              value = os.environ.get(key)
+              if value is None:
+                  missing.add(key)
+                  return match.group(0)
+              return value
+
+          rendered = re.sub(r"\$\{([A-Z0-9_]+)\}", replace_var, template)
+          if missing:
+              raise SystemExit(f"Missing required env vars for job manifest: {', '.join(sorted(missing))}")
+
+          output = Path(os.environ["RUNNER_TEMP"]) / "k8s-build-job.yaml"
+          output.write_text(rendered)
+          print(f"Rendered build job manifest to {output}")
+          PY
+
+      - name: Run K8s build job
+        env:
+          JOB_NAME: ${{ steps.meta.outputs.job_name }}
+        run: |
+          kubectl apply -f "$RUNNER_TEMP/k8s-build-job.yaml"
+          if ! kubectl wait --namespace "$K8S_BUILD_NAMESPACE" --for=condition=complete "job/${JOB_NAME}" --timeout=45m; then
+            kubectl describe --namespace "$K8S_BUILD_NAMESPACE" "job/${JOB_NAME}" || true
+            kubectl logs --namespace "$K8S_BUILD_NAMESPACE" "job/${JOB_NAME}" --all-containers=true || true
+            exit 1
+          fi
+          kubectl logs --namespace "$K8S_BUILD_NAMESPACE" "job/${JOB_NAME}" --all-containers=true
+
+      - name: Clean up build job
+        if: always()
+        env:
+          JOB_NAME: ${{ steps.meta.outputs.job_name }}
+        run: kubectl delete --namespace "$K8S_BUILD_NAMESPACE" "job/${JOB_NAME}" --ignore-not-found
+
+  update-fleet:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out site repo
+        uses: actions/checkout@v4
+
+      - name: Check out fleet repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.FLEET_REPO }}
+          token: ${{ secrets.FLEET_REPO_PAT }}
+          path: k8s-fleet
+
+      - name: Update kustomization image tag
+        env:
+          IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
+        run: |
+          python3 scripts/update_kustomization_newtag.py \
+            --file "k8s-fleet/${FLEET_KUSTOMIZATION_PATH}" \
+            --image "${FLEET_IMAGE_NAME}" \
+            --new-tag "${IMAGE_TAG}"
+
+      - name: Commit fleet update
+        env:
+          IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
+        run: |
+          cd k8s-fleet
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$FLEET_KUSTOMIZATION_PATH"
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m "chore: release jccpokemonpocket ${IMAGE_TAG} [skip ci]"
+          git push origin HEAD:main
