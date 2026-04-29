@@ -21,11 +21,11 @@
   - `www CNAME jccpokemonpocket.lol`
   - `CLOUDFLARE_PROXY_APEX=false`
   - `CLOUDFLARE_PROXY_WWW=false`
-- Registrar nameserver update via Porkbun API result: `UNABLE_TO_UPDATE_DOMAIN` (failed)
-- Observed public behavior:
-  - `http://jccpokemonpocket.lol` still serves parking/origin outside cluster
-  - `https://jccpokemonpocket.lol` TLS handshake fails
-- Conclusion: domain delegation to Cloudflare is not active yet on public DNS.
+- Registrar nameserver update via Porkbun API result: `SUCCESS`
+- Public resolver verification:
+  - `dig +short NS jccpokemonpocket.lol @8.8.8.8` -> `jaziel.ns.cloudflare.com`, `sandra.ns.cloudflare.com`
+  - `dig +short A jccpokemonpocket.lol @8.8.8.8` -> `144.91.77.245`
+- Conclusion: domain delegation to Cloudflare is active.
 
 ## CI/CD and Release Execution
 
@@ -39,25 +39,25 @@
 ## Argo and Workload Status
 
 - Fleet `kustomization.yaml` `newTag`: `36d5ef01d8f8bb3dcd59dde9becf75c9b9d9b1fa`
-- Argo app status: `Synced`, `Progressing` (progressing due live cert challenge pending)
-- Argo source revision observed: `42cddbb7675f82a0a5bb6a3d7daa524ca3f01a2d`
+- Argo app status: `Synced`, `Healthy`
+- Argo source revision observed: `4758d6637f9889c806ad8e5f44e34f6e42766b77`
 - Workload image running:
   - `registry.144.91.77.245.sslip.io/jccpokemonpocket:36d5ef01d8f8bb3dcd59dde9becf75c9b9d9b1fa`
 
 ## Certificate and Ingress
 
 - Preview certificate: `jccpokemonpocket-preview-tls` = `Ready`
-- Live certificate: `jccpokemonpocket-live-tls` = `Not Ready`
-- ACME challenge reason:
-  - `Waiting for HTTP-01 challenge propagation: wrong status code '403', expected '200'`
-- Root cause aligns with public DNS not delegated to Cloudflare yet.
+- Live certificate: `jccpokemonpocket-live-tls` = `Ready`
+- Certificate fix applied:
+  - switched issuer from `letsencrypt-prod` (HTTP-01) to `letsencrypt-prod-cloudflare` (DNS-01)
+- ACME order state: `valid`
 
 ## Live HTTP Checks
 
-- `https://jccpokemonpocket.lol/` -> TLS handshake failure
-- `https://www.jccpokemonpocket.lol/` -> TLS handshake failure
-- `https://jccpokemonpocket.lol/sitemap.xml` -> TLS handshake failure
-- `http://www.jccpokemonpocket.lol/` -> `301` to `http://jccpokemonpocket.lol`
+- `https://jccpokemonpocket.lol/` -> `200`
+- `https://www.jccpokemonpocket.lol/` -> `200`
+- `https://jccpokemonpocket.lol/sitemap.xml` -> `200`
+- `http://www.jccpokemonpocket.lol/` -> redirects to live host
 - Preview endpoint:
   - `https://jccpokemonpocket.144.91.77.245.sslip.io/` -> `200` (with `-k`)
 
@@ -65,26 +65,19 @@
 
 - Preview homepage HTML renders and static assets are available on preview endpoint.
 - Navbar height adjusted from previous value and reduced to compact style (`58px` min height) to stay close to `autoresearch.lol` proportions.
-- Full live browser acceptance is blocked until real domain DNS delegation and live certificate become ready.
+- Skill browser/image scripts require local `playwright` package; in this static-only repo they fail with `MODULE_NOT_FOUND`.
+- Live endpoint and image URLs are reachable by HTTP checks; no broken asset response observed.
 
 ## GSC Ownership
 
 - Scope requested by task: `GSC only`
 - GA4/Clarity/GTM: `not added`
-- GSC setup/check scripts were attempted with existing ADC and Cloudflare zone settings, but operation did not complete within execution window.
-- Current gate result:
-  - `GSC siteOwner`: not confirmed yet
-  - `sitemap listed`: not confirmed yet
-- Dependency: live domain delegation + reachable `https://jccpokemonpocket.lol/sitemap.xml` + successful Google API completion.
+- Final gate result:
+  - `GSC_CHECK_PERMISSION_LEVEL=siteOwner`
+  - `GSC_CHECK_OWNER_CONFIRMED=true`
+  - `GSC_CHECK_SITEMAP_LISTED=true`
 
 ## Outstanding Items
 
-1. Complete registrar nameserver switch from Porkbun to Cloudflare (`jaziel/sandra`).
-2. Wait for live cert-manager order/challenge to pass and `jccpokemonpocket-live-tls` to become `Ready`.
-3. Re-run:
-   - `setup-gsc.sh https://jccpokemonpocket.lol`
-   - `check-gsc-property.sh https://jccpokemonpocket.lol`
-4. Verify final gates:
-   - `siteOwner`
-   - `sitemap listed`
-   - live apex/www/sitemap HTTPS returns expected status.
+1. Optional hardening: add repository release secrets (`KUBE_CONFIG_DATA`, `FLEET_REPO_PAT`) to let GitHub Actions replace manual fallback.
+2. Optional QA: install `playwright` in this repo if full browser/scripted visual gate is required in CI.
