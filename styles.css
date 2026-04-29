@@ -36,14 +36,14 @@ body {
 }
 
 .nav-wrap {
-  min-height: 78px;
+  min-height: 58px;
   display: flex;
   align-items: center;
   justify-content: space-between;
 }
 
 .brand img {
-  width: 210px;
+  width: 186px;
   display: block;
 }
 
